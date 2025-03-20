@@ -1,0 +1,13 @@
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\CameraLedApp.csproj.AssemblyReference.cache
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\Avalonia\Resources.Inputs.cache
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\Avalonia\resources
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\CameraLedApp.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\CameraLedApp.AssemblyInfoInputs.cache
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\CameraLedApp.AssemblyInfo.cs
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\CameraLedApp.csproj.CoreCompileInputs.cache
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\Avalonia\CameraLedApp.dll
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\Avalonia\CameraLedApp.pdb
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\refint\Avalonia\CameraLedApp.dll
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\CameraLedApp.dll
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\refint\CameraLedApp.dll
+C:\Users\erhan\source\repos\CameraLedApp\CameraLedApp\obj\Release\net8.0\CameraLedApp.pdb

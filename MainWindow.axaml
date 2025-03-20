@@ -1,0 +1,144 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="800" d:DesignHeight="600"
+        x:Class="CameraLedApp.MainWindow"
+        Title="Camera and LED Control"
+        Background="#f0f0f0"
+        MinWidth="700" MinHeight="500">
+
+	<Window.Styles>
+		<Style Selector="Button">
+			<Setter Property="Background" Value="#4285F4"/>
+			<Setter Property="Foreground" Value="White"/>
+			<Setter Property="Padding" Value="15,8"/>
+			<Setter Property="CornerRadius" Value="4"/>
+			<Setter Property="Cursor" Value="Hand"/>
+		</Style>
+		<Style Selector="Button:pointerover">
+			<Setter Property="Background" Value="#5294FF"/>
+		</Style>
+		<Style Selector="Button:disabled">
+			<Setter Property="Background" Value="#CCCCCC"/>
+			<Setter Property="Foreground" Value="#888888"/>
+		</Style>
+
+		<!-- LED button styles -->
+		<Style Selector="Button.led-on">
+			<Setter Property="Background" Value="#34A853"/>
+		</Style>
+		<Style Selector="Button.led-on:pointerover">
+			<Setter Property="Background" Value="#45B964"/>
+		</Style>
+		<Style Selector="Button.led-off">
+			<Setter Property="Background" Value="#EA4335"/>
+		</Style>
+		<Style Selector="Button.led-off:pointerover">
+			<Setter Property="Background" Value="#FB5446"/>
+		</Style>
+	</Window.Styles>
+
+	<Grid RowDefinitions="Auto,*,Auto">
+		<!-- Header -->
+		<Border Grid.Row="0" Background="#4285F4" BoxShadow="0 2 10 0 #20000000">
+			<StackPanel Margin="15">
+				<TextBlock Text="Raspberry Pi Camera and LED Control"
+                           FontSize="22" FontWeight="Bold" Foreground="White"
+                           HorizontalAlignment="Center"/>
+				<TextBlock Text="Capture images and control LED with Avalonia UI"
+                           FontSize="14" Foreground="White" Opacity="0.9"
+                           HorizontalAlignment="Center" Margin="0,5,0,0"/>
+			</StackPanel>
+		</Border>
+
+		<!-- Image Display -->
+		<Border Grid.Row="1" Margin="20" BoxShadow="0 0 10 0 #20000000" Background="White" CornerRadius="8">
+			<Grid>
+				<!-- Camera Status Indicator -->
+				<Border Background="#F5F5F5" Padding="10,5" CornerRadius="4"
+						Margin="10,10,10,0" HorizontalAlignment="Right" VerticalAlignment="Top"
+						ZIndex="1">
+					<StackPanel Orientation="Horizontal" Spacing="8">
+						<Ellipse x:Name="CameraStatusIndicator" Width="12" Height="12" Fill="Gray"/>
+						<TextBlock x:Name="CameraStatusText" Text="Camera: Not Connected" VerticalAlignment="Center"/>
+					</StackPanel>
+				</Border>
+
+				<Image x:Name="CameraImage" Stretch="Uniform" Margin="5"/>
+				<TextBlock x:Name="NoImageText" Text="Camera Preview"
+						   FontSize="20" FontWeight="SemiBold" Foreground="#CCCCCC"
+						   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+			</Grid>
+		</Border>
+
+		<!-- Control Panel -->
+		<Border Grid.Row="2" Background="White" BoxShadow="0 -2 10 0 #20000000" Padding="0,15,0,20">
+			<Grid ColumnDefinitions="*,*" Margin="20,0">
+				<!-- Camera Controls -->
+				<Border Grid.Column="0" BorderBrush="#E0E0E0" BorderThickness="0,0,1,0" Padding="0,0,20,0">
+					<StackPanel Orientation="Vertical" Spacing="10">
+						<TextBlock Text="Camera Controls" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,5"/>
+						<StackPanel Orientation="Horizontal" Spacing="15">
+							<Button x:Name="StartCameraButton" Content="Start Camera">
+								<Button.Content>
+									<StackPanel Orientation="Horizontal" Spacing="8">
+										<Path Data="M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2C6.48,2 2,6.48 2,12C2,17.52 6.48,22 12,22C17.52,22 22,17.52 22,12C22,6.48 17.52,2 12,2M10,16.5L16,12L10,7.5V16.5Z"
+                                              Fill="White" Width="16" Height="16" Stretch="Uniform"/>
+										<TextBlock Text="Start Camera"/>
+									</StackPanel>
+								</Button.Content>
+							</Button>
+							<Button x:Name="StopCameraButton" Content="Stop Camera" IsEnabled="False">
+								<Button.Content>
+									<StackPanel Orientation="Horizontal" Spacing="8">
+										<Path Data="M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2C6.48,2 2,6.48 2,12C2,17.52 6.48,22 12,22C17.52,22 22,17.52 22,12C22,6.48 17.52,2 12,2M9,9H15V15H9"
+                                              Fill="White" Width="16" Height="16" Stretch="Uniform"/>
+										<TextBlock Text="Stop Camera"/>
+									</StackPanel>
+								</Button.Content>
+							</Button>
+						</StackPanel>
+					</StackPanel>
+				</Border>
+
+				<!-- LED Controls -->
+				<StackPanel Grid.Column="1" Orientation="Vertical" Spacing="10" Margin="20,0,0,0">
+					<TextBlock Text="LED Controls" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,5"/>
+
+					<!-- GPIO Pin Selection -->
+					<StackPanel Orientation="Horizontal" Spacing="10" Margin="0,0,0,10">
+						<TextBlock Text="GPIO Pin:" VerticalAlignment="Center"/>
+						<ComboBox x:Name="GpioPinComboBox" Width="100" SelectedIndex="0">
+							<ComboBoxItem>GPIO 17</ComboBoxItem>
+							<ComboBoxItem>GPIO 18</ComboBoxItem>
+							<ComboBoxItem>GPIO 27</ComboBoxItem>
+							<ComboBoxItem>GPIO 22</ComboBoxItem>
+							<ComboBoxItem>GPIO 23</ComboBoxItem>
+							<ComboBoxItem>GPIO 24</ComboBoxItem>
+							<ComboBoxItem>GPIO 25</ComboBoxItem>
+						</ComboBox>
+						<Button x:Name="ApplyGpioPinButton" Content="Apply" Width="80"/>
+					</StackPanel>
+
+					<StackPanel Orientation="Horizontal" Spacing="15">
+						<Button x:Name="TurnOnLedButton" Classes="led-on">
+							<StackPanel Orientation="Horizontal" Spacing="8">
+								<Path Data="M12,6A6,6 0 0,1 18,12A6,6 0 0,1 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6M12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9Z"
+									  Fill="White" Width="16" Height="16" Stretch="Uniform"/>
+								<TextBlock Text="Turn On LED"/>
+							</StackPanel>
+						</Button>
+						<Button x:Name="TurnOffLedButton" Classes="led-off" IsEnabled="False">
+							<StackPanel Orientation="Horizontal" Spacing="8">
+								<Path Data="M12,6A6,6 0 0,1 18,12A6,6 0 0,1 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6M12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4Z"
+									  Fill="White" Width="16" Height="16" Stretch="Uniform"/>
+								<TextBlock Text="Turn Off LED"/>
+							</StackPanel>
+						</Button>
+					</StackPanel>
+				</StackPanel>
+			</Grid>
+		</Border>
+	</Grid>
+</Window>
