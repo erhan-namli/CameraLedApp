@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "dgSpecHash": "zNeWBDEqI00=",
+  "dgSpecHash": "+EuRLzohhMY=",
   "success": true,
   "projectFilePath": "C:\\Users\\erhan\\source\\repos\\CameraLedApp\\CameraLedApp\\CameraLedApp.csproj",
   "expectedPackageFiles": [
@@ -56,7 +56,10 @@
     "C:\\Users\\erhan\\.nuget\\packages\\system.text.encodings.web\\6.0.0\\system.text.encodings.web.6.0.0.nupkg.sha512",
     "C:\\Users\\erhan\\.nuget\\packages\\system.text.json\\6.0.9\\system.text.json.6.0.9.nupkg.sha512",
     "C:\\Users\\erhan\\.nuget\\packages\\tmds.dbus.protocol\\0.20.0\\tmds.dbus.protocol.0.20.0.nupkg.sha512",
-    "C:\\Users\\erhan\\.nuget\\packages\\unitsnet\\5.31.0\\unitsnet.5.31.0.nupkg.sha512"
+    "C:\\Users\\erhan\\.nuget\\packages\\unitsnet\\5.31.0\\unitsnet.5.31.0.nupkg.sha512",
+    "C:\\Users\\erhan\\.nuget\\packages\\microsoft.netcore.app.runtime.linux-arm64\\8.0.11\\microsoft.netcore.app.runtime.linux-arm64.8.0.11.nupkg.sha512",
+    "C:\\Users\\erhan\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.linux-arm64\\8.0.11\\microsoft.aspnetcore.app.runtime.linux-arm64.8.0.11.nupkg.sha512",
+    "C:\\Users\\erhan\\.nuget\\packages\\microsoft.netcore.app.host.linux-arm64\\8.0.11\\microsoft.netcore.app.host.linux-arm64.8.0.11.nupkg.sha512"
   ],
   "logs": []
 }

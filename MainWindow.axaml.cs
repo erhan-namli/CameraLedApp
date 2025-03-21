@@ -5,8 +5,6 @@ using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
 using System;
-using System.Diagnostics;
-using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -21,6 +19,8 @@ namespace CameraLedApp
         private Ellipse _cameraStatusIndicator;
         private TextBlock _cameraStatusText;
         private Timer? _cameraCheckTimer;
+        private Timer? _frameUpdateTimer;
+        private const int FRAME_UPDATE_INTERVAL = 200; // Update frames every 200ms
 
         public MainWindow()
         {
@@ -72,7 +72,7 @@ namespace CameraLedApp
             });
         }
 
-        private async void StartCamera_Click(object sender, RoutedEventArgs e)
+        private void StartCamera_Click(object sender, RoutedEventArgs e)
         {
             if (_isCameraRunning)
                 return;
@@ -84,51 +84,49 @@ namespace CameraLedApp
             // Hide the placeholder text when starting camera
             _noImageText.IsVisible = false;
 
-            _cancellationTokenSource = new CancellationTokenSource();
-            var token = _cancellationTokenSource.Token;
+            // Start the camera service
+            _hardwareService.StartCameraService();
 
-            await Task.Run(async () =>
+            _cancellationTokenSource = new CancellationTokenSource();
+
+            // Create a timer to update frames at regular intervals
+            _frameUpdateTimer = new Timer(UpdateFrameCallback, null, 0, FRAME_UPDATE_INTERVAL);
+        }
+
+        private async void UpdateFrameCallback(object? state)
+        {
+            if (!_isCameraRunning || _cancellationTokenSource == null || _cancellationTokenSource.IsCancellationRequested)
+                return;
+
+            try
             {
-                while (!token.IsCancellationRequested && _isCameraRunning)
+                // Get the latest image from the camera service
+                var bitmap = await _hardwareService.CaptureImageAsync(_cancellationTokenSource.Token);
+
+                if (_cancellationTokenSource.IsCancellationRequested)
+                    return;
+
+                // Update the UI on the UI thread
+                await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     try
                     {
-                        // Capture image using the hardware service
-                        var bitmap = await _hardwareService.CaptureImageAsync(token);
-
-                        if (token.IsCancellationRequested)
-                            break;
-
-                        // Load and display the image
-                        await Dispatcher.UIThread.InvokeAsync(() =>
+                        if (bitmap != null)
                         {
-                            try
-                            {
-                                if (bitmap != null)
-                                {
-                                    CameraImage.Source = bitmap;
-                                    _noImageText.IsVisible = false;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"Error displaying image: {ex.Message}");
-                            }
-                        });
-
-                        await Task.Delay(100, token); // Short delay between captures
-                    }
-                    catch (TaskCanceledException)
-                    {
-                        break;
+                            CameraImage.Source = bitmap;
+                            _noImageText.IsVisible = false;
+                        }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Camera error: {ex.Message}");
-                        await Task.Delay(1000, token); // Longer delay if error occurs
+                        Console.WriteLine($"Error displaying image: {ex.Message}");
                     }
-                }
-            }, token);
+                });
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error updating frame: {ex.Message}");
+            }
         }
 
         private void StopCamera_Click(object sender, RoutedEventArgs e)
@@ -141,7 +139,17 @@ namespace CameraLedApp
         private void StopCamera()
         {
             _isCameraRunning = false;
+
+            // Stop the frame update timer
+            _frameUpdateTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+            _frameUpdateTimer?.Dispose();
+            _frameUpdateTimer = null;
+
+            // Cancel any ongoing operations
             _cancellationTokenSource?.Cancel();
+
+            // Stop the camera service
+            _hardwareService.StopCameraService();
 
             // Show the placeholder text when stopping the camera
             Dispatcher.UIThread.InvokeAsync(() =>

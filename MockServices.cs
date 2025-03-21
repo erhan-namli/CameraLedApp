@@ -2,7 +2,6 @@
 using System;
 using System.Device.Gpio;
 using System.IO;
-using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Diagnostics;
@@ -18,9 +17,10 @@ namespace CameraLedApp
         void InitializeGpio();
         void SetLedState(bool isOn);
         void CleanupGpio();
-
         void SetGpioPin(int pinNumber);
         Task<bool> IsCameraAvailableAsync();
+        void StartCameraService();
+        void StopCameraService();
     }
 
     /// <summary>
@@ -28,10 +28,40 @@ namespace CameraLedApp
     /// </summary>
     public class RaspberryPiHardwareService : IHardwareService
     {
-        private int _ledPin = 17; // Define private field for LED pin
+        private int _ledPin = 17;
         private GpioController? _gpioController;
-        private readonly string _tempImagePath = Path.Combine(Path.GetTempPath(), "camera_image.jpg");
         private bool _isLedOn = false;
+        private readonly SemaphoreSlim _frameLock = new SemaphoreSlim(1, 1);
+        private bool _isServiceRunning = false;
+        private CancellationTokenSource? _serviceCts;
+        private Task? _serviceTask;
+        private bool _hasCameraTools = false;
+
+        // Double-buffering for image files
+        private readonly string _imagePathA;
+        private readonly string _imagePathB;
+        private string _currentReadPath;
+        private string _currentWritePath;
+        private bool _usingPathA = true;
+
+        // Current frame as bitmap
+        private Bitmap? _currentFrame;
+        private DateTime _lastFrameTime = DateTime.MinValue;
+
+        public RaspberryPiHardwareService()
+        {
+            // Create temp paths for double-buffering
+            string tempDir = Path.Combine(Path.GetTempPath(), "camera_led_app");
+            Directory.CreateDirectory(tempDir);
+
+            _imagePathA = Path.Combine(tempDir, "camera_image_a.jpg");
+            _imagePathB = Path.Combine(tempDir, "camera_image_b.jpg");
+            _currentReadPath = _imagePathA;
+            _currentWritePath = _imagePathB;
+
+            // Clean up any existing temp files
+            CleanupTempFiles();
+        }
 
         public void InitializeGpio()
         {
@@ -45,26 +75,35 @@ namespace CameraLedApp
             {
                 Console.WriteLine($"Error initializing GPIO: {ex.Message}");
             }
+
+            // Check for camera tools during initialization
+            CheckCameraTools();
+        }
+
+        private void CheckCameraTools()
+        {
+            _hasCameraTools = CheckIfCommandExists("libcamera-still") ||
+                              CheckIfCommandExists("raspistill");
+
+            if (!_hasCameraTools)
+            {
+                Console.WriteLine("Warning: No camera tools (libcamera-still or raspistill) found.");
+            }
         }
 
         public void SetGpioPin(int pinNumber)
         {
             try
             {
-                // Save current LED state
                 bool wasLedOn = _isLedOn;
 
-                // Turn off LED on old pin
                 if (_gpioController != null && _gpioController.IsPinOpen(_ledPin))
                 {
                     _gpioController.Write(_ledPin, PinValue.Low);
                     _gpioController.ClosePin(_ledPin);
                 }
 
-                // Change pin
                 _ledPin = pinNumber;
-
-                // Initialize and restore LED state on new pin
                 _gpioController?.OpenPin(_ledPin, PinMode.Output);
                 SetLedState(wasLedOn);
             }
@@ -87,64 +126,325 @@ namespace CameraLedApp
             }
         }
 
+        public void StartCameraService()
+        {
+            if (_isServiceRunning)
+                return;
 
-        public async Task<Bitmap?> CaptureImageAsync(CancellationToken token)
+            // Kill any existing camera processes
+            KillExistingCameraProcesses();
+
+            // Clean up temp files
+            CleanupTempFiles();
+
+            // Start the camera service
+            _serviceCts = new CancellationTokenSource();
+            _serviceTask = Task.Run(() => CameraServiceLoopAsync(_serviceCts.Token));
+            _isServiceRunning = true;
+
+            Console.WriteLine("Camera service started");
+        }
+
+        public void StopCameraService()
+        {
+            if (!_isServiceRunning)
+                return;
+
+            // Cancel the service task
+            if (_serviceCts != null)
+            {
+                _serviceCts.Cancel();
+                try
+                {
+                    _serviceTask?.Wait(1000);
+                }
+                catch { }
+                _serviceCts.Dispose();
+                _serviceCts = null;
+            }
+
+            // Kill any camera processes
+            KillExistingCameraProcesses();
+
+            // Clean up the current frame
+            _frameLock.Wait();
+            try
+            {
+                _currentFrame?.Dispose();
+                _currentFrame = null;
+            }
+            finally
+            {
+                _frameLock.Release();
+            }
+
+            _isServiceRunning = false;
+            Console.WriteLine("Camera service stopped");
+        }
+
+        private async Task CameraServiceLoopAsync(CancellationToken token)
         {
             try
             {
-                // Use libcamera-jpeg to capture an image
-                using var process = new Process
+                int errorCount = 0;
+
+                while (!token.IsCancellationRequested)
                 {
-                    StartInfo = new ProcessStartInfo
+                    try
                     {
-                        FileName = "libcamera-jpeg",
-                        Arguments = $"-o {_tempImagePath} -n -t 100 --width 800 --height 600 --quality 85",
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        CreateNoWindow = true
+                        // Capture an image to the current write buffer
+                        bool success = await CaptureImageToFileAsync(_currentWritePath, token);
+
+                        if (success)
+                        {
+                            // Wait to ensure the file is fully written
+                            await Task.Delay(50, token);
+
+                            // Swap buffers
+                            await _frameLock.WaitAsync(token);
+                            try
+                            {
+                                // Swap read/write paths
+                                SwapBuffers();
+
+                                // Load the new frame
+                                try
+                                {
+                                    // Dispose old frame if it exists
+                                    _currentFrame?.Dispose();
+
+                                    // Load new frame
+                                    using FileStream fs = new FileStream(_currentReadPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                                    _currentFrame = new Bitmap(fs);
+                                    _lastFrameTime = DateTime.Now;
+
+                                    // Reset error count on success
+                                    errorCount = 0;
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"Error loading frame: {ex.Message}");
+                                    errorCount++;
+                                }
+                            }
+                            finally
+                            {
+                                _frameLock.Release();
+                            }
+                        }
+                        else
+                        {
+                            errorCount++;
+                            Console.WriteLine($"Failed to capture image (error count: {errorCount})");
+                        }
+
+                        // If too many errors, take a longer break
+                        if (errorCount > 5)
+                        {
+                            await Task.Delay(2000, token);
+                            errorCount = 0;
+                        }
+                        else
+                        {
+                            // Normal delay between captures
+                            await Task.Delay(200, token);
+                        }
                     }
-                };
-
-                process.Start();
-                await process.WaitForExitAsync(token);
-
-                if (token.IsCancellationRequested)
-                    return null;
-
-                if (File.Exists(_tempImagePath))
-                {
-                    using var fileStream = File.OpenRead(_tempImagePath);
-                    return new Bitmap(fileStream);
+                    catch (OperationCanceledException)
+                    {
+                        throw; // Rethrow to exit the loop
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error in camera service: {ex.Message}");
+                        errorCount++;
+                        await Task.Delay(500, token); // Delay on error
+                    }
                 }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when service is canceled
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error capturing image: {ex.Message}");
+                Console.WriteLine($"Fatal error in camera service loop: {ex.Message}");
             }
-            return null;
+        }
+
+        private void SwapBuffers()
+        {
+            // Swap the read and write buffers
+            _usingPathA = !_usingPathA;
+
+            if (_usingPathA)
+            {
+                _currentReadPath = _imagePathA;
+                _currentWritePath = _imagePathB;
+            }
+            else
+            {
+                _currentReadPath = _imagePathB;
+                _currentWritePath = _imagePathA;
+            }
+        }
+
+        public async Task<Bitmap?> CaptureImageAsync(CancellationToken token)
+        {
+            // Return null if camera service is not running
+            if (!_isServiceRunning)
+                return null;
+
+            // Use a lock to prevent conflicts with buffer swapping
+            if (!await _frameLock.WaitAsync(100, token))
+                return null;
+
+            try
+            {
+                // If we have a current frame that's recent enough, return a copy
+                if (_currentFrame != null && (DateTime.Now - _lastFrameTime).TotalSeconds < 2)
+                {
+                    try
+                    {
+                        // Create a copy of the bitmap to avoid disposal issues
+                        using MemoryStream ms = new MemoryStream();
+                        _currentFrame.Save(ms);
+                        ms.Position = 0;
+                        return new Bitmap(ms);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error copying frame: {ex.Message}");
+                    }
+                }
+
+                return null;
+            }
+            finally
+            {
+                _frameLock.Release();
+            }
+        }
+
+        private async Task<bool> CaptureImageToFileAsync(string outputPath, CancellationToken token)
+        {
+            Process? process = null;
+
+            try
+            {
+                // Try libcamera-still first
+                if (CheckIfCommandExists("libcamera-still"))
+                {
+                    process = new Process
+                    {
+                        StartInfo = new ProcessStartInfo
+                        {
+                            FileName = "libcamera-still",
+                            Arguments = $"-o {outputPath} --nopreview --immediate -t 1 --width 800 --height 600 --quality 85",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true
+                        }
+                    };
+                }
+                // Fallback to raspistill
+                else if (CheckIfCommandExists("raspistill"))
+                {
+                    process = new Process
+                    {
+                        StartInfo = new ProcessStartInfo
+                        {
+                            FileName = "raspistill",
+                            Arguments = $"-o {outputPath} -t 1 -w 800 -h 600 -q 85 -n",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true
+                        }
+                    };
+                }
+                else
+                {
+                    // No camera tools available
+                    return false;
+                }
+
+                // Start the process
+                process.Start();
+
+                // Wait with timeout to prevent hanging
+                var waitTask = process.WaitForExitAsync(token);
+                var timeoutTask = Task.Delay(3000, token);
+
+                var completedTask = await Task.WhenAny(waitTask, timeoutTask);
+
+                if (completedTask == timeoutTask && !process.HasExited)
+                {
+                    process.Kill();
+                    Console.WriteLine("Camera process killed due to timeout");
+                    return false;
+                }
+
+                // Check if process completed successfully
+                return process.ExitCode == 0 && File.Exists(outputPath) && new FileInfo(outputPath).Length > 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error capturing to file: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                process?.Dispose();
+            }
         }
 
         public async Task<bool> IsCameraAvailableAsync()
         {
             try
             {
-                // A simple check: Try to run libcamera-hello with minimal args just to see if it works
+                // First check if camera tools are installed
+                if (!_hasCameraTools)
+                    return false;
+
+                // Check if camera hardware is available using v4l2-ctl if available
+                if (CheckIfCommandExists("v4l2-ctl"))
+                {
+                    if (!await CheckForCamerasWithV4l2Async())
+                    {
+                        Console.WriteLine("No cameras detected with v4l2-ctl");
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error checking camera: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool CheckIfCommandExists(string command)
+        {
+            try
+            {
                 using var process = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
-                        FileName = "libcamera-hello",
-                        Arguments = "-t 1",
+                        FileName = "which",
+                        Arguments = command,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
-                        RedirectStandardError = true,
                         CreateNoWindow = true
                     }
                 };
 
                 process.Start();
-                await process.WaitForExitAsync();
-
+                process.WaitForExit();
                 return process.ExitCode == 0;
             }
             catch
@@ -152,18 +452,86 @@ namespace CameraLedApp
                 return false;
             }
         }
+
+        private async Task<bool> CheckForCamerasWithV4l2Async()
+        {
+            try
+            {
+                using var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "v4l2-ctl",
+                        Arguments = "--list-devices",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        CreateNoWindow = true
+                    }
+                };
+
+                process.Start();
+                string output = await process.StandardOutput.ReadToEndAsync();
+                await process.WaitForExitAsync();
+
+                // Check if any camera devices were listed
+                return !string.IsNullOrWhiteSpace(output) &&
+                       (output.Contains("/dev/video") || output.Contains("camera"));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error checking for cameras: {ex.Message}");
+                return false;
+            }
+        }
+
+        private void KillExistingCameraProcesses()
+        {
+            try
+            {
+                // Kill existing camera processes
+                Process.Start("pkill", "-f 'libcamera|raspistill'")?.WaitForExit(1000);
+                Thread.Sleep(500);
+            }
+            catch { }
+        }
+
+        private void CleanupTempFiles()
+        {
+            try
+            {
+                if (File.Exists(_imagePathA))
+                    File.Delete(_imagePathA);
+
+                if (File.Exists(_imagePathB))
+                    File.Delete(_imagePathB);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error cleaning up temp files: {ex.Message}");
+            }
+        }
+
         public void CleanupGpio()
         {
+            // Stop camera service
+            StopCameraService();
+
             try
             {
                 if (_gpioController != null)
                 {
-                    _gpioController.Write(_ledPin, PinValue.Low); // Turn off LED
+                    _gpioController.Write(_ledPin, PinValue.Low);
                     _gpioController.ClosePin(_ledPin);
                     _gpioController.Dispose();
                 }
+
+                // Clean up temp files
+                CleanupTempFiles();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error during cleanup: {ex.Message}");
+            }
         }
     }
 
@@ -172,14 +540,8 @@ namespace CameraLedApp
     /// </summary>
     public class MockHardwareService : IHardwareService
     {
-        private int _ledPin = 17; // Define private field for LED pin
+        private int _ledPin = 17;
         private bool _ledState = false;
-        private readonly string[] _mockCameraImages = {
-        "mock_camera_1.jpg",
-        "mock_camera_2.jpg",
-        "mock_camera_3.jpg"
-    };
-        private int _currentImageIndex = 0;
         private bool _mockCameraAvailable = true;
 
         public void InitializeGpio()
@@ -199,57 +561,24 @@ namespace CameraLedApp
             Console.WriteLine($"[MOCK] LED on pin {_ledPin} turned {(_ledState ? "ON" : "OFF")}");
         }
 
-        public async Task<Bitmap?> CaptureImageAsync(CancellationToken token)
+        public void StartCameraService()
         {
-            try
-            {
-                // Simulate camera delay
-                await Task.Delay(100, token);
+            Console.WriteLine("[MOCK] Camera service started");
+        }
 
-                if (token.IsCancellationRequested || !_mockCameraAvailable)
-                    return null;
+        public void StopCameraService()
+        {
+            Console.WriteLine("[MOCK] Camera service stopped");
+        }
 
-                // Load a mock image
-                var assembly = Assembly.GetExecutingAssembly();
-                var resourceName = $"CameraLedApp.Assets.{_mockCameraImages[_currentImageIndex]}";
-
-                using var stream = assembly.GetManifestResourceStream(resourceName);
-                if (stream != null)
-                {
-                    var bitmap = new Bitmap(stream);
-
-                    // Cycle through mock images
-                    _currentImageIndex = (_currentImageIndex + 1) % _mockCameraImages.Length;
-
-                    return bitmap;
-                }
-
-                // If mock images aren't found, create a simple colored bitmap
-                var width = 800;
-                var height = 600;
-
-                using var memoryStream = new MemoryStream();
-                // Code to create a simple colored bitmap would go here
-                // For now just return null
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[MOCK] Error simulating camera: {ex.Message}");
-                return null;
-            }
+        public Task<Bitmap?> CaptureImageAsync(CancellationToken token)
+        {
+            return Task.FromResult<Bitmap?>(null);
         }
 
         public Task<bool> IsCameraAvailableAsync()
         {
-            // For testing, you can toggle this value
             return Task.FromResult(_mockCameraAvailable);
-
-            // Alternatively, to simulate random camera disconnections (for testing):
-            // Random random = new Random();
-            // _mockCameraAvailable = random.Next(10) > 1; // 10% chance of "disconnection"
-            // return Task.FromResult(_mockCameraAvailable);
         }
 
         public void CleanupGpio()

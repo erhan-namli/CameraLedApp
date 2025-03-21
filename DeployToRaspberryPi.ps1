@@ -18,7 +18,7 @@ Set-Location $ProjectPath
 
 # Build the application for Raspberry Pi
 Write-Host "Building application for Raspberry Pi..." -ForegroundColor Yellow
-$buildOutput = dotnet publish -c Release -r linux-arm64 --self-contained true
+$buildOutput = dotnet publish -c RaspberryPi -r linux-arm64 --self-contained true
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed! See errors above." -ForegroundColor Red
     exit 1
@@ -26,8 +26,8 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Build successful!" -ForegroundColor Green
 
-# Path to published files
-$publishPath = Join-Path $ProjectPath "bin\Release\net8.0\linux-arm64\publish"
+# Path to published files (from RaspberryPi directory)
+$publishPath = Join-Path $ProjectPath "bin\RaspberryPi\net8.0\linux-arm64\publish"
 if (-not (Test-Path $publishPath)) {
     Write-Host "Published files not found at $publishPath" -ForegroundColor Red
     exit 1
