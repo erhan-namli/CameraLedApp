@@ -24,7 +24,7 @@ namespace CameraLedApp
     }
 
     /// <summary>
-    /// Real hardware service for Raspberry Pi
+    /// Real hardware service for Raspberry Pi using direct MJPEG streaming
     /// </summary>
     public class RaspberryPiHardwareService : IHardwareService
     {
@@ -34,30 +34,25 @@ namespace CameraLedApp
         private readonly SemaphoreSlim _frameLock = new SemaphoreSlim(1, 1);
         private bool _isServiceRunning = false;
         private CancellationTokenSource? _serviceCts;
-        private Task? _serviceTask;
-        private bool _hasCameraTools = false;
-
-        // Double-buffering for image files
-        private readonly string _imagePathA;
-        private readonly string _imagePathB;
-        private string _currentReadPath;
-        private string _currentWritePath;
-        private bool _usingPathA = true;
-
-        // Current frame as bitmap
+        private Task? _cameraTask;
+        private Process? _cameraProcess;
         private Bitmap? _currentFrame;
-        private DateTime _lastFrameTime = DateTime.MinValue;
+        private readonly string _tempDir;
+        private readonly string _mjpegPipePath;
+        private readonly string _scriptPath;
+        private int _frameCount = 0;
+        private DateTime _lastFrameTime = DateTime.Now;
+        private double _actualFps = 0;
 
         public RaspberryPiHardwareService()
         {
-            // Create temp paths for double-buffering
-            string tempDir = Path.Combine(Path.GetTempPath(), "camera_led_app");
-            Directory.CreateDirectory(tempDir);
+            // Setup temp directory
+            _tempDir = Path.Combine(Path.GetTempPath(), "camera_led_app");
+            Directory.CreateDirectory(_tempDir);
 
-            _imagePathA = Path.Combine(tempDir, "camera_image_a.jpg");
-            _imagePathB = Path.Combine(tempDir, "camera_image_b.jpg");
-            _currentReadPath = _imagePathA;
-            _currentWritePath = _imagePathB;
+            // Setup file paths
+            _mjpegPipePath = Path.Combine(_tempDir, "camera_stream.mjpeg");
+            _scriptPath = Path.Combine(_tempDir, "camera_script.sh");
 
             // Clean up any existing temp files
             CleanupTempFiles();
@@ -74,20 +69,6 @@ namespace CameraLedApp
             catch (Exception ex)
             {
                 Console.WriteLine($"Error initializing GPIO: {ex.Message}");
-            }
-
-            // Check for camera tools during initialization
-            CheckCameraTools();
-        }
-
-        private void CheckCameraTools()
-        {
-            _hasCameraTools = CheckIfCommandExists("libcamera-still") ||
-                              CheckIfCommandExists("raspistill");
-
-            if (!_hasCameraTools)
-            {
-                Console.WriteLine("Warning: No camera tools (libcamera-still or raspistill) found.");
             }
         }
 
@@ -134,14 +115,25 @@ namespace CameraLedApp
             // Kill any existing camera processes
             KillExistingCameraProcesses();
 
-            // Clean up temp files
-            CleanupTempFiles();
+            // Create FIFO pipe
+            CreateMjpegPipe();
+
+            // Create streaming script
+            CreateCameraScript();
 
             // Start the camera service
             _serviceCts = new CancellationTokenSource();
-            _serviceTask = Task.Run(() => CameraServiceLoopAsync(_serviceCts.Token));
-            _isServiceRunning = true;
 
+            // Start camera process first
+            _cameraProcess = StartCameraProcess();
+
+            // Wait a moment for camera to start
+            Thread.Sleep(1000);
+
+            // Start the frame reader task
+            _cameraTask = Task.Run(() => ProcessMjpegStreamAsync(_serviceCts.Token));
+
+            _isServiceRunning = true;
             Console.WriteLine("Camera service started");
         }
 
@@ -150,20 +142,39 @@ namespace CameraLedApp
             if (!_isServiceRunning)
                 return;
 
-            // Cancel the service task
+            Console.WriteLine("Stopping camera service...");
+
+            // Cancel tasks
             if (_serviceCts != null)
             {
                 _serviceCts.Cancel();
                 try
                 {
-                    _serviceTask?.Wait(1000);
+                    if (_cameraTask != null)
+                        _cameraTask.Wait(1000);
                 }
                 catch { }
                 _serviceCts.Dispose();
                 _serviceCts = null;
             }
 
-            // Kill any camera processes
+            // Kill process
+            try
+            {
+                if (_cameraProcess != null && !_cameraProcess.HasExited)
+                {
+                    _cameraProcess.Kill();
+                    _cameraProcess.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error killing processes: {ex.Message}");
+            }
+
+            _cameraProcess = null;
+
+            // Kill any other camera processes
             KillExistingCameraProcesses();
 
             // Clean up the current frame
@@ -182,110 +193,310 @@ namespace CameraLedApp
             Console.WriteLine("Camera service stopped");
         }
 
-        private async Task CameraServiceLoopAsync(CancellationToken token)
+        private void CreateMjpegPipe()
         {
             try
             {
-                int errorCount = 0;
-
-                while (!token.IsCancellationRequested)
+                // Remove existing pipe if it exists
+                if (File.Exists(_mjpegPipePath))
                 {
-                    try
+                    File.Delete(_mjpegPipePath);
+                }
+
+                // Create a FIFO pipe
+                using var process = new Process();
+                process.StartInfo = new ProcessStartInfo
+                {
+                    FileName = "mkfifo",
+                    Arguments = _mjpegPipePath,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+
+                process.Start();
+                process.WaitForExit();
+
+                Console.WriteLine($"Created MJPEG pipe at {_mjpegPipePath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error creating MJPEG pipe: {ex.Message}");
+            }
+        }
+
+        private void CreateCameraScript()
+        {
+            try
+            {
+                string scriptContent;
+
+                // Check which camera tool to use
+                if (CheckIfCommandExists("libcamera-vid"))
+                {
+                    // Script for libcamera-vid - direct MJPEG output
+                    scriptContent = $@"#!/bin/bash
+# Turn off display
+export DISPLAY=
+export WAYLAND_DISPLAY=
+export QT_QPA_PLATFORM=offscreen
+
+# Kill any existing camera processes
+pkill -f 'libcamera|raspivid|ffmpeg|gst-launch' 2>/dev/null || true
+
+# Start streaming - direct MJPEG output
+libcamera-vid --nopreview -t 0 --width 800 --height 600 --framerate 30 --codec mjpeg -o {_mjpegPipePath}
+";
+                }
+                else if (CheckIfCommandExists("raspivid") && CheckIfCommandExists("gst-launch-1.0"))
+                {
+                    // Script for raspivid + gstreamer
+                    scriptContent = $@"#!/bin/bash
+# Turn off display
+export DISPLAY=
+export WAYLAND_DISPLAY=
+
+# Kill any existing camera processes
+pkill -f 'libcamera|raspivid|ffmpeg|gst-launch' 2>/dev/null || true
+
+# Start streaming - h264 to mjpeg via gstreamer
+raspivid -n -t 0 -w 800 -h 600 -fps 30 -o - | \
+  gst-launch-1.0 fdsrc ! h264parse ! avdec_h264 ! jpegenc ! multifilesink location={_mjpegPipePath}
+";
+                }
+                else if (CheckIfCommandExists("raspistill"))
+                {
+                    // Fallback for raspistill - lower framerate but still works
+                    scriptContent = $@"#!/bin/bash
+# Turn off display
+export DISPLAY=
+export WAYLAND_DISPLAY=
+
+# Kill any existing camera processes
+pkill -f 'libcamera|raspivid|raspistill' 2>/dev/null || true
+
+# Start streaming by continuously capturing images
+while true; do
+  raspistill -n -t 1 -w 800 -h 600 -q 85 -o {_mjpegPipePath}
+  sleep 0.05
+done
+";
+                }
+                else
+                {
+                    // No camera tool available
+                    scriptContent = @"#!/bin/bash
+echo ""Error: No camera tools found"" >&2
+exit 1
+";
+                }
+
+                // Write the script with Unix line endings
+                File.WriteAllText(_scriptPath, scriptContent.Replace("\r\n", "\n"));
+
+                // Make it executable
+                Process.Start("chmod", $"+x {_scriptPath}")?.WaitForExit();
+
+                Console.WriteLine($"Created camera script at {_scriptPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error creating camera script: {ex.Message}");
+            }
+        }
+
+        private Process? StartCameraProcess()
+        {
+            try
+            {
+                // Start the camera streaming process
+                var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
                     {
-                        // Capture an image to the current write buffer
-                        bool success = await CaptureImageToFileAsync(_currentWritePath, token);
+                        FileName = "bash",
+                        Arguments = _scriptPath,
+                        UseShellExecute = false,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
 
-                        if (success)
+                process.ErrorDataReceived += (sender, e) =>
+                {
+                    if (!string.IsNullOrEmpty(e.Data))
+                        Console.WriteLine($"Camera process: {e.Data}");
+                };
+
+                process.Start();
+                process.BeginErrorReadLine();
+
+                Console.WriteLine("Started camera process");
+                return process;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error starting camera process: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task ProcessMjpegStreamAsync(CancellationToken token)
+        {
+            try
+            {
+                Console.WriteLine($"Opening MJPEG pipe for reading: {_mjpegPipePath}");
+
+                // Open the MJPEG pipe
+                using FileStream fileStream = new FileStream(_mjpegPipePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+                Console.WriteLine("MJPEG pipe opened successfully");
+
+                // Buffer for reading JPEG data
+                using MemoryStream frameBuffer = new MemoryStream(1024 * 1024); // 1MB initial capacity
+                byte[] buffer = new byte[32 * 1024]; // 32KB read buffer
+
+                // JPEG markers
+                byte[] jpegStartMarker = new byte[] { 0xFF, 0xD8 };
+                byte[] jpegEndMarker = new byte[] { 0xFF, 0xD9 };
+
+                bool inJpegFrame = false;
+                int frameSize = 0;
+                _frameCount = 0;
+
+                DateTime fpsTimer = DateTime.Now;
+                int fpsFrameCount = 0;
+
+                int bytesRead;
+                while (!token.IsCancellationRequested &&
+                      (bytesRead = await fileStream.ReadAsync(buffer, 0, buffer.Length, token)) > 0)
+                {
+                    int offset = 0;
+
+                    while (offset < bytesRead)
+                    {
+                        if (!inJpegFrame)
                         {
-                            // Wait to ensure the file is fully written
-                            await Task.Delay(50, token);
-
-                            // Swap buffers
-                            await _frameLock.WaitAsync(token);
-                            try
+                            // Look for JPEG start marker
+                            if (offset <= bytesRead - 2 &&
+                                buffer[offset] == jpegStartMarker[0] &&
+                                buffer[offset + 1] == jpegStartMarker[1])
                             {
-                                // Swap read/write paths
-                                SwapBuffers();
+                                // Found start of JPEG
+                                inJpegFrame = true;
+                                frameBuffer.SetLength(0);
+                                frameBuffer.Write(buffer, offset, 2);
+                                offset += 2;
+                                frameSize = 2;
+                            }
+                            else
+                            {
+                                offset++;
+                            }
+                        }
+                        else
+                        {
+                            // We're in a JPEG frame
+                            // Find how many bytes we can copy
+                            int bytesToEnd = bytesRead - offset;
 
-                                // Load the new frame
+                            // Look for end marker within this buffer
+                            int endMarkerPos = -1;
+                            for (int i = offset; i <= bytesRead - 2; i++)
+                            {
+                                if (buffer[i] == jpegEndMarker[0] && buffer[i + 1] == jpegEndMarker[1])
+                                {
+                                    endMarkerPos = i;
+                                    break;
+                                }
+                            }
+
+                            if (endMarkerPos >= 0)
+                            {
+                                // Found end marker - copy up to and including it
+                                int bytesToCopy = endMarkerPos - offset + 2;
+                                frameBuffer.Write(buffer, offset, bytesToCopy);
+                                frameSize += bytesToCopy;
+                                offset += bytesToCopy;
+
+                                // Process the complete frame
                                 try
                                 {
-                                    // Dispose old frame if it exists
-                                    _currentFrame?.Dispose();
+                                    ProcessJpegFrame(frameBuffer.ToArray(), frameSize);
 
-                                    // Load new frame
-                                    using FileStream fs = new FileStream(_currentReadPath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                                    _currentFrame = new Bitmap(fs);
-                                    _lastFrameTime = DateTime.Now;
+                                    // Update frame count for FPS calculation
+                                    _frameCount++;
+                                    fpsFrameCount++;
 
-                                    // Reset error count on success
-                                    errorCount = 0;
+                                    // Calculate FPS every second
+                                    TimeSpan elapsed = DateTime.Now - fpsTimer;
+                                    if (elapsed.TotalSeconds >= 1)
+                                    {
+                                        _actualFps = fpsFrameCount / elapsed.TotalSeconds;
+                                        Console.WriteLine($"Camera: {_actualFps:F1} FPS ({fpsFrameCount} frames in {elapsed.TotalSeconds:F1}s)");
+                                        fpsTimer = DateTime.Now;
+                                        fpsFrameCount = 0;
+                                    }
                                 }
                                 catch (Exception ex)
                                 {
-                                    Console.WriteLine($"Error loading frame: {ex.Message}");
-                                    errorCount++;
+                                    Console.WriteLine($"Error processing frame: {ex.Message}");
+                                }
+
+                                inJpegFrame = false;
+                            }
+                            else
+                            {
+                                // End marker not found - copy all bytes and continue
+                                frameBuffer.Write(buffer, offset, bytesToEnd);
+                                frameSize += bytesToEnd;
+                                offset += bytesToEnd;
+
+                                // Safety check to avoid memory issues with corrupted streams
+                                if (frameSize > 5 * 1024 * 1024) // 5MB max frame size
+                                {
+                                    Console.WriteLine("Abnormally large frame detected, resetting");
+                                    inJpegFrame = false;
                                 }
                             }
-                            finally
-                            {
-                                _frameLock.Release();
-                            }
                         }
-                        else
-                        {
-                            errorCount++;
-                            Console.WriteLine($"Failed to capture image (error count: {errorCount})");
-                        }
-
-                        // If too many errors, take a longer break
-                        if (errorCount > 5)
-                        {
-                            await Task.Delay(2000, token);
-                            errorCount = 0;
-                        }
-                        else
-                        {
-                            // Normal delay between captures
-                            await Task.Delay(200, token);
-                        }
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw; // Rethrow to exit the loop
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error in camera service: {ex.Message}");
-                        errorCount++;
-                        await Task.Delay(500, token); // Delay on error
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                // Expected when service is canceled
+                // Expected when canceled
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Fatal error in camera service loop: {ex.Message}");
+                Console.WriteLine($"Error processing MJPEG stream: {ex.Message}");
             }
         }
 
-        private void SwapBuffers()
+        private void ProcessJpegFrame(byte[] frameData, int frameSize)
         {
-            // Swap the read and write buffers
-            _usingPathA = !_usingPathA;
+            try
+            {
+                // Create bitmap from JPEG data
+                using var ms = new MemoryStream(frameData, 0, frameSize);
+                var bitmap = new Bitmap(ms);
 
-            if (_usingPathA)
-            {
-                _currentReadPath = _imagePathA;
-                _currentWritePath = _imagePathB;
+                // Update the current frame
+                _frameLock.Wait();
+                try
+                {
+                    _currentFrame?.Dispose();
+                    _currentFrame = bitmap;
+                    _lastFrameTime = DateTime.Now;
+                }
+                finally
+                {
+                    _frameLock.Release();
+                }
             }
-            else
+            catch (Exception ex)
             {
-                _currentReadPath = _imagePathB;
-                _currentWritePath = _imagePathA;
+                // Uncomment for detailed error logging
+                // Console.WriteLine($"Error creating bitmap: {ex.Message}");
             }
         }
 
@@ -295,18 +506,18 @@ namespace CameraLedApp
             if (!_isServiceRunning)
                 return null;
 
-            // Use a lock to prevent conflicts with buffer swapping
+            // Use a lock to prevent conflicts with frame processing
             if (!await _frameLock.WaitAsync(100, token))
                 return null;
 
             try
             {
-                // If we have a current frame that's recent enough, return a copy
-                if (_currentFrame != null && (DateTime.Now - _lastFrameTime).TotalSeconds < 2)
+                // If we have a current frame, return a copy
+                if (_currentFrame != null)
                 {
                     try
                     {
-                        // Create a copy of the bitmap to avoid disposal issues
+                        // Create a copy of the bitmap
                         using MemoryStream ms = new MemoryStream();
                         _currentFrame.Save(ms);
                         ms.Position = 0;
@@ -326,87 +537,20 @@ namespace CameraLedApp
             }
         }
 
-        private async Task<bool> CaptureImageToFileAsync(string outputPath, CancellationToken token)
-        {
-            Process? process = null;
-
-            try
-            {
-                // Try libcamera-still first
-                if (CheckIfCommandExists("libcamera-still"))
-                {
-                    process = new Process
-                    {
-                        StartInfo = new ProcessStartInfo
-                        {
-                            FileName = "libcamera-still",
-                            Arguments = $"-o {outputPath} --nopreview --immediate -t 1 --width 800 --height 600 --quality 85",
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            CreateNoWindow = true
-                        }
-                    };
-                }
-                // Fallback to raspistill
-                else if (CheckIfCommandExists("raspistill"))
-                {
-                    process = new Process
-                    {
-                        StartInfo = new ProcessStartInfo
-                        {
-                            FileName = "raspistill",
-                            Arguments = $"-o {outputPath} -t 1 -w 800 -h 600 -q 85 -n",
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            CreateNoWindow = true
-                        }
-                    };
-                }
-                else
-                {
-                    // No camera tools available
-                    return false;
-                }
-
-                // Start the process
-                process.Start();
-
-                // Wait with timeout to prevent hanging
-                var waitTask = process.WaitForExitAsync(token);
-                var timeoutTask = Task.Delay(3000, token);
-
-                var completedTask = await Task.WhenAny(waitTask, timeoutTask);
-
-                if (completedTask == timeoutTask && !process.HasExited)
-                {
-                    process.Kill();
-                    Console.WriteLine("Camera process killed due to timeout");
-                    return false;
-                }
-
-                // Check if process completed successfully
-                return process.ExitCode == 0 && File.Exists(outputPath) && new FileInfo(outputPath).Length > 0;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error capturing to file: {ex.Message}");
-                return false;
-            }
-            finally
-            {
-                process?.Dispose();
-            }
-        }
-
         public async Task<bool> IsCameraAvailableAsync()
         {
             try
             {
-                // First check if camera tools are installed
-                if (!_hasCameraTools)
+                // Check for camera tools
+                bool hasLibcameraVid = CheckIfCommandExists("libcamera-vid");
+                bool hasRaspivid = CheckIfCommandExists("raspivid");
+                bool hasRaspistill = CheckIfCommandExists("raspistill");
+
+                if (!hasLibcameraVid && !hasRaspivid && !hasRaspistill)
+                {
+                    Console.WriteLine("No camera tools found");
                     return false;
+                }
 
                 // Check if camera hardware is available using v4l2-ctl if available
                 if (CheckIfCommandExists("v4l2-ctl"))
@@ -489,7 +633,7 @@ namespace CameraLedApp
             try
             {
                 // Kill existing camera processes
-                Process.Start("pkill", "-f 'libcamera|raspistill'")?.WaitForExit(1000);
+                Process.Start("pkill", "-f 'libcamera|raspivid|raspistill|ffmpeg|gst-launch'")?.WaitForExit(1000);
                 Thread.Sleep(500);
             }
             catch { }
@@ -499,11 +643,11 @@ namespace CameraLedApp
         {
             try
             {
-                if (File.Exists(_imagePathA))
-                    File.Delete(_imagePathA);
+                if (File.Exists(_mjpegPipePath))
+                    File.Delete(_mjpegPipePath);
 
-                if (File.Exists(_imagePathB))
-                    File.Delete(_imagePathB);
+                if (File.Exists(_scriptPath))
+                    File.Delete(_scriptPath);
             }
             catch (Exception ex)
             {
